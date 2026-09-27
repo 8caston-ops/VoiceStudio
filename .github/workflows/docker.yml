@@ -22,7 +22,8 @@
 #   :0.3-rocm       — major.minor floating tag, ROCm build
 #   :sha-xxxx-rocm  — specific commit SHA, ROCm build
 #
-# Images land at: ghcr.io/debpalash/omnivoice-studio AND docker.io/palashdeb/omnivoice-studio
+# Images land at: ghcr.io/debpalash/voicestudio, the legacy GHCR alias
+# ghcr.io/debpalash/omnivoice-studio, and docker.io/palashdeb/omnivoice-studio
 # (Docker Hub push gated on the DOCKERHUB_USERNAME/DOCKERHUB_TOKEN secrets;
 # if unset the build still pushes to GHCR.)
 #
@@ -41,6 +42,19 @@ on:
     tags: ['v*']
     branches: [main]
   workflow_dispatch:
+    inputs:
+      backfill_release:
+        description: Copy an existing release into canonical GHCR/Docker Hub tags
+        type: boolean
+        default: false
+      release_ref:
+        description: Release tag to build when backfilling (for example v0.5.6)
+        type: string
+        required: false
+      promote_stable:
+        description: Also move stable tags to this backfilled release
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -48,16 +62,11 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  # PINNED, not ${{ github.repository }}. The repository was renamed to
-  # `VoiceStudio`, and deriving the image path from it would have silently
-  # moved published images to ghcr.io/debpalash/voicestudio — while Docker Hub
-  # (a hardcoded literal below) stayed put. Everyone pulling the documented
-  # GHCR path would have kept getting the last pre-rename image forever: no
-  # error, no warning, just a channel that quietly stopped updating. A
-  # published image path is a promise to users, not a mirror of the repo name.
-  # Renaming it is a deliberate migration (publish to both, document the move,
-  # then retire the old), not a side effect of renaming the repo.
-  IMAGE_NAME: debpalash/omnivoice-studio
+  # Keep registry coordinates explicit. VoiceStudio is the canonical GHCR
+  # path; the old path remains a compatibility alias during the migration.
+  IMAGE_NAME: debpalash/voicestudio
+  # Compatibility alias: keep existing deployments on the same tag stream.
+  LEGACY_IMAGE_NAME: debpalash/omnivoice-studio
   DOCKERHUB_IMAGE: palashdeb/omnivoice-studio
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -66,6 +75,29 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.backfill_release && inputs.release_ref || github.sha }}
+
+      - name: Validate release backfill ref
+        if: inputs.backfill_release
+        shell: bash
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: |
+          [[ "$RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${RELEASE_REF}^{commit}")"
+          TAG_VERSION="${RELEASE_REF#v}"
+          PACKAGE_VERSION="$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')"
+          if [[ "$(printf '%s\n' "$TAG_VERSION" '0.5.6' | sort -V | tail -n1)" == '0.5.6' ]]; then
+            test "$PACKAGE_VERSION" = '1.0.0'
+          else
+            test "$PACKAGE_VERSION" = "$TAG_VERSION"
+          fi
+
+      - name: Resolve image source commit
+        id: source
+        shell: bash
+        run: echo "short_sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
 
       # Both image builds run right at the runner's disk ceiling (CUDA hit
       # ENOSPC 2026-07-16 morning; ROCm hit it the same afternoon even with
@@ -125,6 +157,7 @@ jobs:
           # tags in that case.
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY }}/${{ env.LEGACY_IMAGE_NAME }}
             ${{ steps.dockerhub.outputs.enabled == 'true' && env.DOCKERHUB_IMAGE || '' }}
           tags: |
             type=semver,pattern={{version}},enable=${{ github.event_name == 'push' }}
@@ -132,7 +165,7 @@ jobs:
             type=raw,value=stable,enable=${{ github.event_name == 'push' && github.ref_type == 'tag' && !contains(github.ref, '-') }}
             type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=raw,value=main,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-            type=sha,prefix=sha-,format=short
+            type=raw,value=sha-${{ steps.source.outputs.short_sha }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -144,6 +177,37 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # One-time migration path for releases that predate the canonical GHCR
+      # coordinate. The explicit ref is validated against package.json before
+      # the freshly built sha tag is promoted in both registries.
+      - name: Backfill canonical GHCR release tags
+        if: inputs.backfill_release
+        shell: bash
+        env:
+          DOCKERHUB_ENABLED: ${{ steps.dockerhub.outputs.enabled }}
+          PROMOTE_STABLE: ${{ inputs.promote_stable }}
+          RELEASE_REF: ${{ inputs.release_ref }}
+          SOURCE_TAG: sha-${{ steps.source.outputs.short_sha }}
+        run: |
+          VERSION="${RELEASE_REF#v}"
+          MINOR="${VERSION%.*}"
+          TAGS=("$VERSION" "$MINOR")
+          if [[ "$PROMOTE_STABLE" == "true" ]]; then TAGS=(stable "${TAGS[@]}"); fi
+          for IMAGE in "$IMAGE_NAME" "$LEGACY_IMAGE_NAME"; do
+            for TAG in "${TAGS[@]}"; do
+              docker buildx imagetools create \
+                --tag "${REGISTRY}/${IMAGE}:${TAG}" \
+                "${REGISTRY}/${IMAGE}:${SOURCE_TAG}"
+            done
+          done
+          if [[ "$DOCKERHUB_ENABLED" == "true" ]]; then
+            for TAG in "${TAGS[@]}"; do
+              docker buildx imagetools create \
+                --tag "${DOCKERHUB_IMAGE}:${TAG}" \
+                "${DOCKERHUB_IMAGE}:${SOURCE_TAG}"
+            done
+          fi
 
       # Sync the Docker Hub repository overview from deploy/dockerhub-overview.md.
       # Only on main pushes (the overview tracks the rolling preview) and only
@@ -177,6 +241,29 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.backfill_release && inputs.release_ref || github.sha }}
+
+      - name: Validate release backfill ref
+        if: inputs.backfill_release
+        shell: bash
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: |
+          [[ "$RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${RELEASE_REF}^{commit}")"
+          TAG_VERSION="${RELEASE_REF#v}"
+          PACKAGE_VERSION="$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')"
+          if [[ "$(printf '%s\n' "$TAG_VERSION" '0.5.6' | sort -V | tail -n1)" == '0.5.6' ]]; then
+            test "$PACKAGE_VERSION" = '1.0.0'
+          else
+            test "$PACKAGE_VERSION" = "$TAG_VERSION"
+          fi
+
+      - name: Resolve image source commit
+        id: source
+        shell: bash
+        run: echo "short_sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
 
       # The ROCm base (~25 GB unpacked) plus build layers need every GB.
       # Same reclaim list as the CUDA job above — keep them identical
@@ -221,6 +308,7 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY }}/${{ env.LEGACY_IMAGE_NAME }}
             ${{ steps.dockerhub.outputs.enabled == 'true' && env.DOCKERHUB_IMAGE || '' }}
           # latest=false is load-bearing: metadata-action's default (`auto`)
           # would add a bare un-suffixed `:latest` on release-tag pushes,
@@ -232,7 +320,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},suffix=-rocm,enable=${{ github.event_name == 'push' }}
             type=raw,value=stable-rocm,enable=${{ github.event_name == 'push' && github.ref_type == 'tag' && !contains(github.ref, '-') }}
             type=raw,value=rocm,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-            type=sha,prefix=sha-,suffix=-rocm,format=short
+            type=raw,value=sha-${{ steps.source.outputs.short_sha }}-rocm
 
       # cache-from only: reading the CUDA job's exported cache reuses the
       # identical frontend-builder stage. Deliberately NO cache-to — the
@@ -250,3 +338,31 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
+
+      - name: Backfill canonical GHCR release tags (ROCm)
+        if: inputs.backfill_release
+        shell: bash
+        env:
+          DOCKERHUB_ENABLED: ${{ steps.dockerhub.outputs.enabled }}
+          PROMOTE_STABLE: ${{ inputs.promote_stable }}
+          RELEASE_REF: ${{ inputs.release_ref }}
+          SOURCE_TAG: sha-${{ steps.source.outputs.short_sha }}-rocm
+        run: |
+          VERSION="${RELEASE_REF#v}"
+          MINOR="${VERSION%.*}"
+          TAGS=("${VERSION}-rocm" "${MINOR}-rocm")
+          if [[ "$PROMOTE_STABLE" == "true" ]]; then TAGS=(stable-rocm "${TAGS[@]}"); fi
+          for IMAGE in "$IMAGE_NAME" "$LEGACY_IMAGE_NAME"; do
+            for TAG in "${TAGS[@]}"; do
+              docker buildx imagetools create \
+                --tag "${REGISTRY}/${IMAGE}:${TAG}" \
+                "${REGISTRY}/${IMAGE}:${SOURCE_TAG}"
+            done
+          done
+          if [[ "$DOCKERHUB_ENABLED" == "true" ]]; then
+            for TAG in "${TAGS[@]}"; do
+              docker buildx imagetools create \
+                --tag "${DOCKERHUB_IMAGE}:${TAG}" \
+                "${DOCKERHUB_IMAGE}:${SOURCE_TAG}"
+            done
+          fi
